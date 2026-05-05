@@ -879,14 +879,39 @@ _PLACEHOLDER_REPLACEMENTS = [
 ]
 
 
+_FRIENDLY_FALLBACK = (
+    "Dear Customer,\n\n"
+    "Thank you for contacting Beaver's Choice Paper Company. Unfortunately, "
+    "we are unable to complete your request at this time due to a temporary "
+    "issue on our end. We sincerely apologize for the inconvenience.\n\n"
+    "A member of our team will follow up with you shortly to assist you "
+    "with a personalized quote.\n\n"
+    "Warm regards,\n"
+    "The Beaver's Choice Team\n"
+)
+
+# Bracketed internal failure markers that must never reach the customer.
+_INTERNAL_FAILURE_MARKERS = re.compile(
+    r"\[(?:orchestrator failed|error:|multi-agent system disabled)",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_customer_reply(text: str) -> str:
     """Strip internal artefacts and resolve template placeholders."""
     if not text:
-        return text
+        return _FRIENDLY_FALLBACK
+    # If the entire reply is just an internal failure marker, replace with
+    # a generic, customer-friendly apology.
+    stripped = text.strip()
+    if stripped.startswith("[") and _INTERNAL_FAILURE_MARKERS.search(stripped):
+        return _FRIENDLY_FALLBACK
     # Drop lines that leak internal-only data.
     cleaned_lines = []
     for line in text.splitlines():
         if any(p.search(line) for p in _INTERNAL_LINE_PATTERNS):
+            continue
+        if _INTERNAL_FAILURE_MARKERS.search(line):
             continue
         cleaned_lines.append(line)
     out = "\n".join(cleaned_lines)
@@ -1063,7 +1088,24 @@ def call_multi_agent_system(
                 flush=True,
             )
             time.sleep(backoff)
-    return f"[orchestrator failed after {max_attempts} attempts: {last_error}]"
+    # Internal failure (timeout, network, etc). Log internally but return a
+    # customer-friendly apology that does not leak technical details.
+    print(
+        f"  [orchestrator failed after {max_attempts} attempts: {last_error}]",
+        flush=True,
+    )
+    return _sanitize_customer_reply(
+        "Dear Customer,\n\n"
+        "Thank you for reaching out to Beaver's Choice Paper Company. "
+        "Unfortunately, we are unable to process your request at this time "
+        "due to a temporary issue on our end. We sincerely apologize for "
+        "the inconvenience.\n\n"
+        "A member of our team will follow up with you shortly to provide a "
+        "personalized quote and answer any questions you may have. We "
+        "appreciate your patience and understanding.\n\n"
+        "Warm regards,\n"
+        "The Beaver's Choice Team\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1114,7 +1156,18 @@ def run_test_scenarios():
         try:
             response = call_multi_agent_system(request_with_date)
         except Exception as exc:
-            response = f"[error: {exc}]"
+            print(f"  [unhandled exception in orchestrator: {exc!r}]", flush=True)
+            response = _sanitize_customer_reply(
+                "Dear Customer,\n\n"
+                "Thank you for contacting Beaver's Choice Paper Company. "
+                "Unfortunately, we were unable to complete your request at "
+                "this time due to a temporary issue on our end. We "
+                "sincerely apologize for the inconvenience.\n\n"
+                "A member of our team will be in touch shortly to assist "
+                "you with a personalized quote.\n\n"
+                "Warm regards,\n"
+                "The Beaver's Choice Team\n"
+            )
 
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]
