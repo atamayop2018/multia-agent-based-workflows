@@ -843,6 +843,61 @@ def tool_get_cash(as_of_date: str) -> str:
     return json.dumps({"cash_balance": round(get_cash_balance(as_of_date), 2)})
 
 
+def tool_financial_report(as_of_date: str) -> str:
+    """
+    Return a JSON snapshot of the company's financial position as of the given
+    date. Wraps :func:`generate_financial_report` so the orchestrator can
+    consult cash balance, inventory valuation, total assets, per-item stock
+    summary and top-selling products before committing large quotes.
+    """
+    report = generate_financial_report(as_of_date)
+    return json.dumps(report, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Customer-reply sanitizer
+# ---------------------------------------------------------------------------
+# The LLM occasionally leaks internal data into the customer-facing reply
+# (transaction IDs, raw cash-balance failure messages, "[Your Name]" template
+# placeholders copied from historical emails). We strip those before returning
+# the final response so the customer sees only business-appropriate content.
+
+_INTERNAL_LINE_PATTERNS = [
+    re.compile(r"transaction[_ ]id", re.IGNORECASE),
+    re.compile(r"\btxn[_ ]?ids?\b", re.IGNORECASE),
+    re.compile(r"inadequate cash balance", re.IGNORECASE),
+    re.compile(r"insufficient cash", re.IGNORECASE),
+    re.compile(r"cash balance (?:is|of)\s*\$", re.IGNORECASE),
+    re.compile(r"cannot initiate a restock", re.IGNORECASE),
+]
+
+_PLACEHOLDER_REPLACEMENTS = [
+    (re.compile(r"\[Your Name\]"), "The Beaver's Choice Team"),
+    (re.compile(r"\[Your Position\]"), "Customer Care"),
+    (re.compile(r"\[Your Business Name\]"), "Beaver's Choice Paper Company"),
+    (re.compile(r"\[Hotel Name\]"), "Beaver's Choice Paper Company"),
+]
+
+
+def _sanitize_customer_reply(text: str) -> str:
+    """Strip internal artefacts and resolve template placeholders."""
+    if not text:
+        return text
+    # Drop lines that leak internal-only data.
+    cleaned_lines = []
+    for line in text.splitlines():
+        if any(p.search(line) for p in _INTERNAL_LINE_PATTERNS):
+            continue
+        cleaned_lines.append(line)
+    out = "\n".join(cleaned_lines)
+    # Resolve placeholders.
+    for pattern, replacement in _PLACEHOLDER_REPLACEMENTS:
+        out = pattern.sub(replacement, out)
+    # Collapse 3+ blank lines to a single blank line.
+    out = re.sub(r"\n{3,}", "\n\n", out).strip() + "\n"
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Specialist agents
 # ---------------------------------------------------------------------------
@@ -931,9 +986,24 @@ if _PYDANTIC_AI_AVAILABLE:
             "   message that includes: the itemised quote, total, any "
             "   discounts applied, expected delivery date, and confirmation "
             "   that the order has been recorded (or an apology if not).\n"
-            "Always pass the request date through to every specialist."
+            "Always pass the request date through to every specialist.\n"
+            "IMPORTANT customer-facing rules: never include internal data in "
+            "the final reply (no transaction IDs, no raw cash-balance "
+            "numbers, no internal failure reasons such as 'insufficient "
+            "cash'). If a sale cannot be fulfilled, apologise generically "
+            "and offer to follow up. Sign every reply as "
+            "'The Beaver's Choice Team' — never use placeholders such as "
+            "'[Your Name]'. You may call tool_financial_report or "
+            "tool_get_cash internally, but their results must NOT appear in "
+            "the customer message."
         ),
-        tools=[delegate_to_inventory, delegate_to_quoting, delegate_to_ordering, tool_get_cash],
+        tools=[
+            delegate_to_inventory,
+            delegate_to_quoting,
+            delegate_to_ordering,
+            tool_get_cash,
+            tool_financial_report,
+        ],
     )
 
 
@@ -980,7 +1050,7 @@ def call_multi_agent_system(
     for attempt in range(1, max_attempts + 1):
         outcome = _run_orchestrator_once(request_with_date, hard_timeout)
         if "output" in outcome:
-            return outcome["output"]
+            return _sanitize_customer_reply(outcome["output"])
         if outcome.get("timeout"):
             last_error = f"timeout after {hard_timeout:.0f}s"
         else:
