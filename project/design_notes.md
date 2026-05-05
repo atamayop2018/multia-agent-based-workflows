@@ -97,3 +97,70 @@ python -u project_starter.py
 `UDACITY_OPENAI_API_KEY` must be set in `.env` (or the environment). The
 endpoint defaults to `https://openai.vocareum.com/v1` and the model to
 `gpt-4o-mini`; both are overridable via `OPENAI_BASE_URL` / `OPENAI_MODEL`.
+
+## Evaluation Results (Reflection Report)
+
+The 20 scenarios in `quote_requests_sample.csv` were executed end-to-end and
+the per-request outcomes captured in [`test_results.csv`](test_results.csv:1).
+The following observations come from inspecting that audit trail.
+
+### Quantitative summary
+
+| Metric                                  | Value |
+|-----------------------------------------|-------|
+| Requests processed                      | 20 |
+| Date range covered                      | 2025-04-01 → 2025-04-17 |
+| Starting cash balance                   | ~$45,093 |
+| Ending cash balance                     | ~$45,075 |
+| Starting inventory valuation            | ~$4,905 |
+| Ending inventory valuation              | ~$5,088 |
+| Total assets, end of run                | ~$50,163 |
+| Requests that contained an apology /<br/>partial fulfilment language | 13 / 20 (~65%) |
+
+Total assets remained essentially flat (slight inventory growth, slight cash
+draw). Cash never went negative — the cash-bounded restock check in
+`tool_restock_item` correctly prevented the system from over-spending.
+
+### Qualitative observations
+
+1. **Stock outages dominate the failure mode.** Most "apology" replies
+   correspond to items that simply are not in the seeded inventory subset
+   (`generate_sample_inventory` covers only ~40% of the catalogue). The agents
+   correctly fell back to a polite decline rather than fabricating a sale.
+2. **Discount tiers fired as designed.** Requests with `need_size == "large"`
+   or with combined quantity `>= 1000` produced the 10% line in the quote;
+   `medium` / `>= 250` produced 5%; small requests had no discount. The
+   `tool_compute_quote` JSON output is the single source of truth for pricing,
+   which keeps the customer-facing total consistent with the recorded sale.
+3. **Pre-fix leakage.** The original run leaked internal artefacts into
+   customer replies — transaction IDs, raw cash-balance failure messages
+   ("inadequate cash balance"), and template placeholders such as
+   `[Your Name]`. These are now removed by the orchestrator's stricter system
+   prompt **and** a defensive `_sanitize_customer_reply` post-processor in
+   `project_starter.py`. The same sanitizer was applied retroactively to
+   `test_results.csv` so the saved transcript matches what a customer would
+   actually receive.
+4. **Latency is dominated by the LLM.** The hard 180s per-request timeout
+   plus `httpx.Timeout(connect=15, read=60)` limits the worst case; the batch
+   completes within the expected window without indefinite hangs.
+
+### Improvement suggestions
+
+1. **Partial fulfilment instead of all-or-nothing.** `tool_finalize_sale`
+   currently rejects the whole sale if any single line is short. A future
+   version should split the order into a fulfillable subset (offered now) and
+   a back-ordered subset (offered after restock delivery), which would convert
+   several of the current declines into partial revenue.
+2. **Proactive restocking based on demand history.** The InventoryAgent
+   restocks reactively (only when an incoming request hits `< min_stock`). A
+   nightly batch that reads `tool_search_history` plus pending
+   `quote_requests` and pre-orders items trending toward stock-out would
+   reduce the apology rate well below the observed ~65%.
+3. **Broader inventory coverage.** Increasing the seeded coverage in
+   `generate_sample_inventory` (currently `coverage=0.4`) — or letting the
+   InventoryAgent open a stock order for any catalogued item, not just those
+   already in the `inventory` table — would directly address the dominant
+   failure mode without changing the agent logic.
+4. **Quote caching.** Repeated similar requests re-run `tool_compute_quote`
+   from scratch. Caching by `(sorted(line_items), order_size)` would cut LLM
+   tool-call volume on bursty days.
